@@ -1,0 +1,125 @@
+#include <iostream>
+#include <pcl/common/common.h>
+#include <pcl/io/pcd_io.h>
+#include <pcl/io/ply_io.h>
+#include <pcl/search/kdtree.h>
+#include <pcl/features/normal_3d_omp.h>
+#include <pcl/point_types.h>
+#include <pcl/surface/mls.h>
+#include <pcl/surface/poisson.h>
+#include <pcl/filters/passthrough.h>
+#include <pcl/visualization/pcl_visualizer.h>
+#include <pcl/PolygonMesh.h>
+#include <boost/thread/thread.hpp>
+#include <ctime>
+#include <cmath>
+
+using namespace pcl;
+using namespace std;
+
+// -------------------------------------------------------------------
+// Compute volume and surface area of a triangle mesh (PolygonMesh)
+// Assumes mesh is composed of triangles (closed manifold)
+// volume = absolute sum of signed tetrahedron volumes w.r.t. origin
+// area   = sum of triangle areas
+// -------------------------------------------------------------------
+void computeMeshVolumeAndArea(const PolygonMesh& mesh, double& volume, double& area)
+{
+    volume = 0.0;
+    area = 0.0;
+
+    // Convert mesh.cloud to PointCloud<PointXYZ> for easy access to coordinates
+    PointCloud<PointXYZ>::Ptr cloud(new PointCloud<PointXYZ>);
+    fromPCLPointCloud2(mesh.cloud, *cloud);
+
+    // Iterate over all polygons (triangles)
+    for (size_t i = 0; i < mesh.polygons.size(); ++i)
+    {
+        const Vertices& verts = mesh.polygons[i];
+        if (verts.vertices.size() != 3)
+            continue;  // skip non‑triangles (should not happen with Poisson)
+
+        // Get the three vertices
+        const PointXYZ& p1 = cloud->points[verts.vertices[0]];
+        const PointXYZ& p2 = cloud->points[verts.vertices[1]];
+        const PointXYZ& p3 = cloud->points[verts.vertices[2]];
+
+        // Compute vectors
+        Eigen::Vector3d v1(p2.x - p1.x, p2.y - p1.y, p2.z - p1.z);
+        Eigen::Vector3d v2(p3.x - p1.x, p3.y - p1.y, p3.z - p1.z);
+
+        // Area of triangle = 0.5 * |v1 × v2|
+        Eigen::Vector3d cross = v1.cross(v2);
+        double tri_area = 0.5 * cross.norm();
+        area += tri_area;
+
+        // Signed tetrahedron volume (with respect to origin)
+        // V_tet = (p1 · (p2 × p3)) / 6
+        Eigen::Vector3d p1v(p1.x, p1.y, p1.z);
+        Eigen::Vector3d p2v(p2.x, p2.y, p2.z);
+        Eigen::Vector3d p3v(p3.x, p3.y, p3.z);
+        double signed_vol = p1v.dot(p2v.cross(p3v)) / 6.0;
+        volume += signed_vol;
+    }
+    volume = std::abs(volume);  // absolute value for closed manifold
+}
+
+// -------------------------------------------------------------------
+int main(int argc, char** argv)
+{
+    clock_t startTime = clock();  // start timing
+
+    // ---------- Load point cloud ----------
+    PCDReader reader;
+    PointCloud<PointXYZ>::Ptr cloud(new PointCloud<PointXYZ>);
+    reader.read("D:\\Cube.pcd", *cloud);
+
+    // ---------- Compute normals ----------
+    NormalEstimationOMP<PointXYZ, Normal> ne;
+    ne.setNumberOfThreads(8);
+    ne.setInputCloud(cloud);
+    ne.setRadiusSearch(0.02);   // adjust as needed
+    Eigen::Vector4f centroid;
+    compute3DCentroid(*cloud, centroid);
+    ne.setViewPoint(centroid[0], centroid[1], centroid[2]);
+
+    PointCloud<Normal>::Ptr cloud_normals(new PointCloud<Normal>());
+    ne.compute(*cloud_normals);
+
+    // Flip normals consistently (in case they point inward)
+    for (size_t i = 0; i < cloud_normals->size(); ++i) {
+        cloud_normals->points[i].normal_x *= -1;
+        cloud_normals->points[i].normal_y *= -1;
+        cloud_normals->points[i].normal_z *= -1;
+    }
+
+    // Concatenate XYZ + normal into PointNormal
+    PointCloud<PointNormal>::Ptr cloud_smoothed_normals(new PointCloud<PointNormal>());
+    concatenateFields(*cloud, *cloud_normals, *cloud_smoothed_normals);
+    cout << "Normals computed." << endl;
+
+    // ---------- Poisson reconstruction ----------
+    Poisson<PointNormal> poisson;
+    poisson.setInputCloud(cloud_smoothed_normals);
+    // poisson.setDepth(9);  // optional: adjust depth for detail level
+
+    PolygonMesh mesh;
+    poisson.reconstruct(mesh);
+
+    // Save the reconstructed mesh as PLY
+    io::savePLYFile("D:\\poisson_mesh.ply", mesh);
+    cout << "Poisson reconstruction finished. Mesh saved to D:\\poisson_mesh.ply" << endl;
+
+    // ---------- Compute volume and surface area ----------
+    double volume = 0.0, area = 0.0;
+    computeMeshVolumeAndArea(mesh, volume, area);
+    cout << "Mesh volume  = " << volume << endl;
+    cout << "Mesh surface area = " << area << endl;
+
+    // ---------- Timing ----------
+    clock_t endTime = clock();
+    cout << "Run time: " << (double)(endTime - startTime) / CLOCKS_PER_SEC << " s" << endl;
+
+    system("pause");
+    return 0;
+}

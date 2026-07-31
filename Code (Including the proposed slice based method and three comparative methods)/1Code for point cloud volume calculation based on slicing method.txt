@@ -1,0 +1,249 @@
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <string>
+#include <cmath>
+#include <ctime>
+#include <pcl/io/pcd_io.h>
+#include <pcl/point_types.h>
+#include <pcl/common/common.h>
+#include <pcl/kdtree/kdtree.h>
+#include <pcl/kdtree/kdtree_flann.h>
+#include <pcl/surface/concave_hull.h>
+#include <pcl/search/kdtree.h>
+#include <pcl/search/organized.h>
+
+using namespace std;
+
+// ------------------------------------------------------------
+// Function 1: Point cloud slicing
+// Input: original cloud, slice thickness, tolerance, output the thinnest top layer thickness (reference)
+// Return: vector of sliced point cloud pointers (each slice is a PointCloud pointer)
+// ------------------------------------------------------------
+vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> sliceCloud(
+    const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
+    float Thickness,
+    float D_short,
+    float& Thickness_minimum)
+{
+    // 1. Find the minimum and maximum z values
+    float zuidi = cloud->points[0].z;
+    float zuigao = cloud->points[0].z;
+    for (size_t i = 1; i < cloud->points.size(); ++i) {
+        if (zuidi > cloud->points[i].z) zuidi = cloud->points[i].z;
+        if (zuigao < cloud->points[i].z) zuigao = cloud->points[i].z;
+    }
+
+    // 2. Calculate total number of layers (excluding the topmost layer)
+    int cengshu = static_cast<int>((zuigao - zuidi) / Thickness);
+    Thickness_minimum = zuigao - zuidi - cengshu * Thickness;
+
+    // 3. Slice and store
+    vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> slices;
+    int jishu = 0;
+    for (float i = 0; i <= cengshu + 1; ++i) {
+        pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_qiepian(new pcl::PointCloud<pcl::PointXYZ>);
+
+        if (i != cengshu + 1) {
+            // Ordinary layers
+            float center_z = zuidi + jishu * Thickness;
+            for (size_t j = 0; j < cloud->points.size(); ++j) {
+                float z = cloud->points[j].z;
+                // Select points falling within [center_z - D_short, center_z + D_short)
+                if ((z >= center_z && z < center_z + D_short) ||
+                    (z >= center_z - D_short && z < center_z)) {
+                    pcl::PointXYZ p;
+                    p.x = cloud->points[j].x;
+                    p.y = cloud->points[j].y;
+                    p.z = center_z;   // Project to the slice center height
+                    cloud_qiepian->push_back(p);
+                }
+            }
+        }
+        else {
+            // Topmost layer (fixed tolerance 0.01, keeping original logic)
+            for (size_t j = 0; j < cloud->points.size(); ++j) {
+                if (cloud->points[j].z >= zuigao - 0.01 && cloud->points[j].z <= zuigao) {
+                    pcl::PointXYZ p;
+                    p.x = cloud->points[j].x;
+                    p.y = cloud->points[j].y;
+                    p.z = zuigao;
+                    cloud_qiepian->push_back(p);
+                }
+            }
+        }
+        slices.push_back(cloud_qiepian);
+        jishu++;
+    }
+    return slices;
+}
+
+// ------------------------------------------------------------
+// Function 2: Extract contour points from each slice (using concave hull)
+// Input: vector of sliced point clouds, radius coefficient Radius_Value
+// Return: vector of contour point clouds (order matches slices; empty cloud means no valid contour)
+// ------------------------------------------------------------
+vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> extractContours(
+    const vector<pcl::PointCloud<pcl::PointXYZ>::Ptr>& slices,
+    float Radius_Value)
+{
+    vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> contours;
+
+    for (size_t idx = 0; idx < slices.size(); ++idx) {
+        pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_in = slices[idx];
+        pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_hull(new pcl::PointCloud<pcl::PointXYZ>);
+
+        // If the slice is empty, return an empty contour
+        if (cloud_in->empty()) {
+            contours.push_back(cloud_hull);
+            continue;
+        }
+
+        // Build KdTree for computing average radius
+        pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
+        tree->setInputCloud(cloud_in);
+
+        int size_cloud = cloud_in->size();
+        int step = size_cloud / 10;
+        if (step < 1) step = 1;   // avoid division by zero
+        double total_distance = 0;
+        int j = 0;
+        for (int i = 0; i < size_cloud; i += step, ++j) {
+            vector<int> pointIdxNKNSearch(2);
+            vector<float> pointNKNSquaredDistance(2);
+            tree->nearestKSearch(cloud_in->points[i], 2, pointIdxNKNSearch, pointNKNSquaredDistance);
+            total_distance += pointNKNSquaredDistance[1] + pointNKNSquaredDistance[0];
+        }
+        float mean_radius = sqrt(total_distance / j);
+
+        // Concave hull extraction
+        pcl::ConcaveHull<pcl::PointXYZ> chull;
+        chull.setInputCloud(cloud_in);
+        chull.setAlpha(Radius_Value * mean_radius);
+        chull.reconstruct(*cloud_hull);
+
+        contours.push_back(cloud_hull);
+    }
+    return contours;
+}
+
+// ------------------------------------------------------------
+// Function 3: Compute volume (based on contour clouds and trapezoidal integration)
+// Input: contour cloud vector (order corresponds to layers), layer thicknesses (regular and topmost)
+// Return: total volume
+// ------------------------------------------------------------
+float computeVolume(
+    const vector<pcl::PointCloud<pcl::PointXYZ>::Ptr>& contours,
+    float houdu,
+    float houdu_zuishang)
+{
+    vector<float> Area;  // store area of each layer, length equals contours.size()
+
+    for (size_t idx = 0; idx < contours.size(); ++idx) {
+        pcl::PointCloud<pcl::PointXYZ>::Ptr cloud = contours[idx];
+        float area_layer = 0.0f;
+
+        // If contour points less than 5, treat as invalid and area = 0
+        if (cloud->size() > 5) {
+            // 1. Compute centroid (as polygon center)
+            float Center_x = 0, Center_y = 0;
+            for (size_t i = 0; i < cloud->size(); ++i) {
+                Center_x += cloud->points[i].x;
+                Center_y += cloud->points[i].y;
+            }
+            Center_x /= cloud->size();
+            Center_y /= cloud->size();
+
+            // 2. Extract coordinates and compute polar angles
+            vector<float> Coord_x, Coord_y;
+            vector<float> Angle;
+            for (size_t i = 0; i < cloud->size(); ++i) {
+                float dx = cloud->points[i].x - Center_x;
+                float dy = cloud->points[i].y - Center_y;
+                float ang = atan2(dy, dx);   // range (-pi, pi]
+                if (ang < 0) ang += 2 * M_PI; // convert to [0, 2pi)
+                Coord_x.push_back(cloud->points[i].x);
+                Coord_y.push_back(cloud->points[i].y);
+                Angle.push_back(ang);
+            }
+
+            // 3. Sort by polar angle (bubble sort, keep coordinates synchronized)
+            for (size_t i = 0; i < Angle.size() - 1; ++i) {
+                for (size_t j = i + 1; j < Angle.size(); ++j) {
+                    if (Angle[i] > Angle[j]) {
+                        swap(Angle[i], Angle[j]);
+                        swap(Coord_x[i], Coord_x[j]);
+                        swap(Coord_y[i], Coord_y[j]);
+                    }
+                }
+            }
+
+            // 4. Close the polygon
+            Coord_x.push_back(Coord_x[0]);
+            Coord_y.push_back(Coord_y[0]);
+
+            // 5. Triangulation (with centroid as vertex) and sum areas
+            for (size_t i = 1; i < Coord_x.size(); ++i) {
+                double x1 = Coord_x[i - 1], y1 = Coord_y[i - 1];
+                double x2 = Coord_x[i], y2 = Coord_y[i];
+                double x3 = Center_x, y3 = Center_y;
+                // Heron's formula
+                double len1 = sqrt((x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2));
+                double len2 = sqrt((x1 - x3) * (x1 - x3) + (y1 - y3) * (y1 - y3));
+                double len3 = sqrt((x2 - x3) * (x2 - x3) + (y2 - y3) * (y2 - y3));
+                double s = (len1 + len2 + len3) / 2.0;
+                double area = sqrt(s * (s - len1) * (s - len2) * (s - len3));
+                if (area > 0) area_layer += area;
+            }
+        }
+        Area.push_back(area_layer);
+    }
+
+    // 6. Trapezoidal integration to get total volume
+    float Volume = 0.0f;
+    // First n-1 layers (each height = houdu)
+    for (size_t i = 1; i < Area.size() - 1; ++i) {
+        Volume += (Area[i] + Area[i - 1]) * houdu / 2.0f;
+    }
+    // Topmost layer (height = houdu_zuishang)
+    if (Area.size() >= 2) {
+        size_t last = Area.size() - 1;
+        Volume += (Area[last] + Area[last - 1]) * houdu_zuishang / 2.0f;
+    }
+    return Volume;
+}
+
+// ------------------------------------------------------------
+// Main program
+// ------------------------------------------------------------
+int main(int argc, char** argv)
+{
+    clock_t startTime = clock();
+
+    // -------- User only needs to define these three variables --------
+    float Thickness = 0.06;          // slice thickness (meters)
+    float D_short = 0.005;           // slice tolerance (meters)
+    float Radius_Value = 15;         // concave hull radius coefficient
+    // -----------------------------------------------------------------
+
+    // 1. Read original point cloud (modify path as needed)
+    pcl::PCDReader reader;
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
+    reader.read("D:\\Cube.pcd", *cloud);
+
+    // 2. Slicing
+    float Thickness_minimum;
+    auto slices = sliceCloud(cloud, Thickness, D_short, Thickness_minimum);
+
+    // 3. Extract contours
+    auto contours = extractContours(slices, Radius_Value);
+
+    // 4. Compute volume
+    float Volume = computeVolume(contours, Thickness, Thickness_minimum);
+    cout << "Volume: " << Volume << endl;
+
+    clock_t endTime = clock();
+    cout << "Run time: " << (double)(endTime - startTime) / CLOCKS_PER_SEC << "s" << endl;
+    system("pause");
+    return 0;
+}

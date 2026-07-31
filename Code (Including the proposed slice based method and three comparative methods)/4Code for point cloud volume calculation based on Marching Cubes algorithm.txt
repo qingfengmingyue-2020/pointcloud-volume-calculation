@@ -1,0 +1,144 @@
+#include <iostream>
+#include <pcl/io/pcd_io.h>
+#include <pcl/point_types.h>
+#include <pcl/features/normal_3d.h>
+#include <pcl/surface/marching_cubes_hoppe.h>
+#include <pcl/visualization/pcl_visualizer.h>   // optional
+#include <pcl/io/ply_io.h>
+#include <pcl/common/common.h>                  // for centroid
+#include <pcl/PolygonMesh.h>
+#include <ctime>
+#include <cmath>
+
+using namespace pcl;
+using namespace std;
+
+// -------------------------------------------------------------------
+// Compute volume and surface area of a triangle mesh (PolygonMesh)
+// Assumes mesh is composed of triangles (closed manifold)
+// volume = absolute sum of signed tetrahedron volumes w.r.t. origin
+// area   = sum of triangle areas
+// -------------------------------------------------------------------
+void computeMeshVolumeAndArea(const PolygonMesh& mesh, double& volume, double& area)
+{
+    volume = 0.0;
+    area = 0.0;
+
+    // Convert mesh.cloud to PointCloud<PointXYZ> for easy access to coordinates
+    PointCloud<PointXYZ>::Ptr cloud(new PointCloud<PointXYZ>);
+    fromPCLPointCloud2(mesh.cloud, *cloud);
+
+    // Iterate over all polygons (triangles)
+    for (size_t i = 0; i < mesh.polygons.size(); ++i)
+    {
+        const Vertices& verts = mesh.polygons[i];
+        if (verts.vertices.size() != 3)
+            continue;  // skip non‑triangles (should not happen with MarchingCubes)
+
+        // Get the three vertices
+        const PointXYZ& p1 = cloud->points[verts.vertices[0]];
+        const PointXYZ& p2 = cloud->points[verts.vertices[1]];
+        const PointXYZ& p3 = cloud->points[verts.vertices[2]];
+
+        // Compute vectors
+        Eigen::Vector3d v1(p2.x - p1.x, p2.y - p1.y, p2.z - p1.z);
+        Eigen::Vector3d v2(p3.x - p1.x, p3.y - p1.y, p3.z - p1.z);
+
+        // Area of triangle = 0.5 * |v1 × v2|
+        Eigen::Vector3d cross = v1.cross(v2);
+        double tri_area = 0.5 * cross.norm();
+        area += tri_area;
+
+        // Signed tetrahedron volume (with respect to origin)
+        // V_tet = (p1 · (p2 × p3)) / 6
+        Eigen::Vector3d p1v(p1.x, p1.y, p1.z);
+        Eigen::Vector3d p2v(p2.x, p2.y, p2.z);
+        Eigen::Vector3d p3v(p3.x, p3.y, p3.z);
+        double signed_vol = p1v.dot(p2v.cross(p3v)) / 6.0;
+        volume += signed_vol;
+    }
+    volume = std::abs(volume);  // absolute value for closed manifold
+}
+
+int main(int argc, char** argv) {
+    clock_t startTime = clock();
+
+    // 1. Load point cloud
+    PointCloud<PointXYZ>::Ptr cloud(new PointCloud<PointXYZ>);
+    if (io::loadPCDFile<PointXYZ>("D:\\Cube.pcd", *cloud) == -1) {
+        PCL_ERROR("Couldn't read file\n");
+        return (-1);
+    }
+    cout << "Loaded " << cloud->points.size() << " points." << endl;
+
+    // 2. Estimate normals
+    NormalEstimation<PointXYZ, Normal> n;
+    PointCloud<Normal>::Ptr normals(new PointCloud<Normal>);
+    search::KdTree<PointXYZ>::Ptr tree(new search::KdTree<PointXYZ>);
+    tree->setInputCloud(cloud);
+    n.setInputCloud(cloud);
+    n.setSearchMethod(tree);
+    n.setKSearch(20);
+    n.compute(*normals);
+    cout << "Computed " << normals->points.size() << " normals." << endl;
+
+    // 3. Concatenate fields
+    PointCloud<PointNormal>::Ptr cloud_with_normals(new PointCloud<PointNormal>);
+    concatenateFields(*cloud, *normals, *cloud_with_normals);
+
+    // 4. Flip normals to point outward (using centroid as viewpoint)
+    Eigen::Vector4f centroid;
+    compute3DCentroid(*cloud, centroid);
+    Eigen::Vector3f view_point(centroid[0], centroid[1], centroid[2]);
+    for (auto& pn : cloud_with_normals->points) {
+        Eigen::Vector3f normal(pn.normal[0], pn.normal[1], pn.normal[2]);
+        Eigen::Vector3f to_view = view_point - Eigen::Vector3f(pn.x, pn.y, pn.z);
+        if (normal.dot(to_view) < 0) {
+            pn.normal[0] *= -1;
+            pn.normal[1] *= -1;
+            pn.normal[2] *= -1;
+        }
+    }
+    cout << "Normals flipped to face outward." << endl;
+
+    // 5. Create MarchingCubesHoppe object
+    MarchingCubesHoppe<PointNormal> mc;
+
+    // Set input cloud (with normals)
+    mc.setInputCloud(cloud_with_normals);
+
+    // 6. Set grid resolution (adjustable)
+    mc.setGridResolution(150, 150, 150);   // increase for more detail
+
+    // 7. Set iso level (default 0)
+    mc.setIsoLevel(0.0f);
+
+    // 8. Extend grid to prevent clipping
+    mc.setPercentageExtendGrid(0.1f);
+
+    // 9. Reconstruct
+    PolygonMesh mesh;
+    mc.reconstruct(mesh);
+    cout << "Reconstructed mesh with " << mesh.polygons.size() << " triangles." << endl;
+
+    // Optional: output vertex count
+    size_t vertex_count = mesh.cloud.data.size() / (sizeof(float) * 3);
+    cout << "Vertex count: " << vertex_count << endl;
+
+    // 10. Save result
+    io::savePLYFileBinary("D:\\marching_cubes_mesh.ply", mesh);
+    cout << "Mesh saved to D:\\marching_cubes_mesh.ply" << endl;
+
+    // 11. Compute volume and surface area
+    double volume = 0.0, area = 0.0;
+    computeMeshVolumeAndArea(mesh, volume, area);
+    cout << "Mesh volume  = " << volume << endl;
+    cout << "Mesh surface area = " << area << endl;
+
+    // 12. Timing
+    clock_t endTime = clock();
+    cout << "Run time: " << (double)(endTime - startTime) / CLOCKS_PER_SEC << " s" << endl;
+
+    system("pause");
+    return 0;
+}

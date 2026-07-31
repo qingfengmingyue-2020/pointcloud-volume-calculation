@@ -1,0 +1,47 @@
+#include <iostream>
+#include <pcl/io/pcd_io.h>
+#include <pcl/point_types.h>
+#include <pcl/surface/convex_hull.h>
+#include <pcl/io/ply_io.h>
+#include <pcl/conversions.h> // for toPCLPointCloud2
+#include <ctime>
+
+int main() {
+    clock_t startTime, endTime;
+    startTime = clock();
+    // 1. Load point cloud
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>);
+    if (pcl::io::loadPCDFile<pcl::PointXYZ>("D:\\Cube.pcd", *cloud) == -1) {
+        PCL_ERROR("Couldn't read file D:\\Cube.pcd \n");
+        return (-1);
+    }
+    std::cout << "Loaded " << cloud->size() << " points." << std::endl;
+
+    // 2. Compute convex hull
+    pcl::ConvexHull<pcl::PointXYZ> hull;
+    hull.setInputCloud(cloud);
+    hull.setComputeAreaVolume(true); // Important: enable area and volume calculation
+
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_hull(new pcl::PointCloud<pcl::PointXYZ>);
+    std::vector<pcl::Vertices> polygons;
+    hull.reconstruct(*cloud_hull, polygons);
+
+    // 3. Get volume and area
+    double volume = hull.getTotalVolume();
+    double area = hull.getTotalArea();
+
+    std::cout << "Convex hull volume: " << volume << std::endl;
+    std::cout << "Convex hull surface area: " << area << std::endl;
+
+    // 4. Save convex hull model as PLY
+    pcl::PolygonMesh mesh;
+    pcl::toPCLPointCloud2(*cloud_hull, mesh.cloud);
+    mesh.polygons = polygons;
+    pcl::io::savePLYFileBinary("D:\\convex_hull_model.ply", mesh);
+    std::cout << "Convex hull model saved as D:\\convex_hull_model.ply" << std::endl;
+
+    endTime = clock();
+    std::cout << "Run time: " << (double)(endTime - startTime) / CLOCKS_PER_SEC << "s" << std::endl;
+    system("pause");
+    return 0;
+}
